@@ -31,8 +31,8 @@ model:
             groups: 16
     patience: null
     save_top_k_models: 10
-    learning_rate: 3.77e-4
-    weight_decay: 0.0
+    learning_rate: 7.16e-4
+    weight_decay: 4.42e-4
 data:
   class_path: train.data.datasets.SimilarityDataset
   init_args:
