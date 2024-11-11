@@ -76,7 +76,7 @@ def create_runfile(
     if pipeline == "tune":
         train_cmd = "lightray --config tune.yaml -- --config cbc.yaml"
     else:
-        train_cmd = f"amplfi-{mode}-cli fit --config cbc.yaml"
+        train_cmd = f"amplfi-{mode}-cli fit --config {TRAIN_CONFIGS[mode][0]}"
 
     content = f"""
     #!/bin/bash
