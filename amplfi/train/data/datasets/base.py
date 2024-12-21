@@ -103,7 +103,7 @@ class AmplfiDataset(pl.LightningDataModule):
         """
         Download s3 data if it doesn't exist.
         """
-        logger = logging.getLogger("AframeDataset")
+        logger = logging.getLogger(self.__class__.__name__)
         bucket, _ = fs_utils.split_data_dir(self.hparams.data_dir)
         if bucket is None:
             return
@@ -130,7 +130,7 @@ class AmplfiDataset(pl.LightningDataModule):
             return world_size, rank
 
     def get_logger(self, world_size, rank):
-        logger_name = "AmplfiDataset"
+        logger_name = self.__class__.__name__
         if world_size > 1:
             logger_name += f":{rank}"
         return logging.getLogger(logger_name)
@@ -188,7 +188,7 @@ class AmplfiDataset(pl.LightningDataModule):
     @property
     def val_batch_size(self):
         """Use larger batch sizes when we don't need gradients."""
-        return int(2 * self.hparams.batch_size)
+        return int(1 * self.hparams.batch_size)
 
     @property
     def train_val_fnames(self):

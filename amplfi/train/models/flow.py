@@ -18,23 +18,19 @@ class FlowModel(AmplfiModel):
         arch:
             Neural network architecture to train.
             This should be a subclass of `FlowArchitecture`.
-        learning_rate;
-            Learning rate for the optimizer
-        weight_decay:
-            Weight decay for the optimizer
-        save_top_k_models:
-            Maximum number of best-performing model checkpoints
-            to keep during training
         samples_per_event:
             Number of samples to draw per event for testing
+        nside:
+            nside parameter for healpy
     """
 
     def __init__(
         self,
         *args,
         arch: FlowArchitecture,
-        samples_per_event: int = 20000,
+        samples_per_event: int = 200000,
         num_corner: int = 10,
+        nside: int = 128,
         **kwargs,
     ) -> None:
 
@@ -43,6 +39,7 @@ class FlowModel(AmplfiModel):
         self.model = arch
         self.samples_per_event = samples_per_event
         self.num_corner = num_corner
+        self.nside = nside
 
         # save our hyperparameters
         self.save_hyperparameters(ignore=["arch"])
@@ -154,6 +151,7 @@ class FlowModel(AmplfiModel):
                 levels=(0.5, 0.9),
             )
             result.plot_mollview(
+                self.nside,
                 outpath=skymap_filename,
             )
         self.idx += 1
@@ -170,7 +168,7 @@ class FlowModel(AmplfiModel):
         # searched area cum hist
         searched_areas = []
         for result in self.test_results:
-            searched_area = result.calculate_searched_area()
+            searched_area = result.calculate_searched_area(self.nside)
             searched_areas.append(searched_area)
         searched_areas = np.sort(searched_areas)
         counts = np.arange(1, len(searched_areas) + 1) / len(searched_areas)
