@@ -2,6 +2,7 @@ import torch
 
 from .base import AmplfiDataset
 
+from ml4gw import gw
 
 class FlowDataset(AmplfiDataset):
     """
@@ -50,4 +51,8 @@ class FlowDataset(AmplfiDataset):
         psds = psds[:, :, mask]
         asds = torch.sqrt(psds)
 
-        return X, asds, parameters
+        net_snr = gw.compute_network_snr(
+                X, psds, self.hparams.sample_rate, self.hparams.highpass
+        )
+
+        return X, asds, parameters, net_snr
