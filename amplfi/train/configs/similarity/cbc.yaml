@@ -30,7 +30,7 @@ trainer:
 model:
   class_path: amplfi.train.models.similarity.SimilarityModel
   init_args:
-    outdir: ${oc.env:AMPLFI_OUTDIR}
+    train_outdir: ${oc.env:AMPLFI_OUTDIR}
     similarity_loss: 
       class_path: amplfi.train.losses.VICRegLoss
       init_args:
@@ -38,7 +38,7 @@ model:
         mu_param: 25.0
         nu_param: 1.0
     # add path below when running `trainer.test` to load in a checkpoint
-    checkpoint: null
+    # checkpoint: null
     arch:
       class_path: amplfi.train.architectures.embeddings.SimilarityEmbedding
       init_args:
@@ -73,11 +73,11 @@ data:
     ifos: ["H1", "L1"]
     min_valid_duration: 10000.0
     waveform_sampler: 
-      class_path: amplfi.train.data.waveforms.generator.cbc.FrequencyDomainCBCGenerator
+      class_path: amplfi.train.data.waveforms.generator.cbc.CBCGenerator
       init_args:
         num_fit_params: 100000
         parameter_sampler: 
-          class_path: amplfi.train.priors.cbc_prior
+          class_path: amplfi.train.priors.aligned_cbc_prior
         dec: 
           class_path: ml4gw.distributions.Cosine
         psi: 
@@ -94,10 +94,10 @@ data:
         num_test_waveforms: 200
         approximant: ml4gw.waveforms.IMRPhenomD
         f_min: 20
-        f_max: 1024
-        ringdown_duration: 1.0
-        waveform_arguments:
-          f_ref: 40
+        #f_max: 1024
+        right_pad: 0.5
+        #ringdown_duration: 1.0
+        f_ref: 40.0
     augmentor: 
       class_path: amplfi.train.data.augmentors.TimeTranslator
       init_args:
