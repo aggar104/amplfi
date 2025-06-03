@@ -1,3 +1,5 @@
+from functools import partial
+import multiprocessing as mp
 from astropy import io
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -6,10 +8,11 @@ from gwpy.timeseries import TimeSeries
 import lightning.pytorch as pl
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy
 import h5py
 import bilby
 from tqdm.auto import tqdm
-
+import ligo.skymap.plot  # noqa: F401
 
 if TYPE_CHECKING:
     from ligo.skymap.postprocess.crossmatch import CrossmatchResult
@@ -42,11 +45,11 @@ class StrainVisualization(pl.Callback):
         if batch_idx >= self.num_plot:
             return
 
-        outdir = self.outdir / f"event_{batch_idx}"
+        outdir = self.outdir / str(batch_idx)
         outdir.mkdir(exist_ok=True)
 
         # unpack batch
-        strain, asds, _ = batch
+        strain, asds, *_ = batch
         strain, asds = strain[0].cpu().numpy(), asds[0].cpu().numpy()
 
         # steal some attributes needed from datamodule
@@ -200,7 +203,7 @@ class PlotMollview(pl.Callback):
         # test_step returns bilby result object
         result = outputs
 
-        outdir = self.outdir / f"event_{batch_idx}"
+        outdir = self.outdir / str(batch_idx)
         outdir.mkdir(exist_ok=True)
         skymap_filename = outdir / "mollview.png"
         result.plot_mollview(
@@ -249,7 +252,7 @@ class PlotCorner(pl.Callback):
 
         # test_step returns bilby result object
         result = outputs
-        outdir = self.outdir / f"event_{batch_idx}"
+        outdir = self.outdir / str(batch_idx)
         self.plot_corner(result, outdir)
 
     def on_predict_batch_end(
@@ -267,16 +270,23 @@ class PlotCorner(pl.Callback):
 class SaveFITS(pl.Callback):
     """ """
 
-    def __init__(self, outdir: Path, nside: int):
+    def __init__(self, outdir: Path, nside: int, min_samples_per_pix: int):
         self.outdir = outdir
         self.nside = nside
+        self.min_samples_per_pix = min_samples_per_pix
 
     def save_fits(
         self,
         result: "AmplfiResult",
         outdir: Path,
     ):
-        fits = io.fits.table_to_hdu(result.to_skymap(self.nside))
+        fits = io.fits.table_to_hdu(
+            result.to_skymap(
+                self.nside,
+                self.min_samples_per_pix,
+                use_distance=True,
+            )
+        )
         outdir.mkdir(exist_ok=True)
         fits.writeto(outdir / "amplfi.skymap.fits", overwrite=True)
 
@@ -296,7 +306,7 @@ class SaveFITS(pl.Callback):
 
         # test_step returns bilby result object
         result = outputs
-        outdir = self.outdir / f"event_{batch_idx}"
+        outdir = self.outdir / str(batch_idx)
         outdir.mkdir(exist_ok=True)
         self.save_fits(result, outdir)
 
@@ -330,7 +340,9 @@ class SavePosterior(pl.Callback):
         # ligo skymap and save full result to have
         # access to the true injection parameters
         result.save_posterior_samples(outdir / "posterior_samples.dat")
-        result.save_to_file(outdir / "result.hdf5", extension="hdf5")
+        result.save_to_file(
+            outdir / "result.hdf5", extension="hdf5", overwrite=True
+        )
 
     def on_test_batch_end(
         self,
@@ -349,7 +361,7 @@ class SavePosterior(pl.Callback):
         # test_step returns bilby result object
         result = outputs
 
-        outdir = self.outdir / f"event_{batch_idx}"
+        outdir = self.outdir / str(batch_idx)
         outdir.mkdir(exist_ok=True)
 
         self.save_posterior(result, outdir)
@@ -375,9 +387,28 @@ class ProbProbPlot(pl.Callback):
         bilby.result.make_pp_plot(
             pl_module.test_results,
             save=True,
-            filename=pl_module.test_outdir / "pp-plot.png",
+            filename=pl_module.test_outdir / "plots" / "pp-plot.png",
             keys=pl_module.inference_params,
         )
+
+
+def crossmatch_skymap(
+    result: "AmplfiResult",
+    nside: int,
+    min_samples_per_pix: int,
+    contours: tuple[float],
+):
+    """
+    Function to process each skymap and calculate crossmatch statistics.
+    """
+
+    crossmatch_result = result.to_crossmatch_result(
+        nside=nside,
+        min_samples_per_pix=min_samples_per_pix,
+        use_distance=True,
+        contours=contours,
+    )
+    return crossmatch_result
 
 
 class CrossMatchStatistics(pl.Callback):
@@ -427,17 +458,23 @@ class CrossMatchStatistics(pl.Callback):
     def on_test_epoch_end(self, _, pl_module: "FlowModel"):
         crossmatch_results: list["CrossmatchResult"] = []
         test_outdir = pl_module.test_outdir
-        logger = pl_module._logger
-        logger.info("Calculating cross match statistics for each result")
-        for result in tqdm(pl_module.test_results):
-            # calculate skymap staistics via ligo.skymap.postprocess.crossmatch
-            crossmatch_result = result.to_crossmatch_result(
-                nside=pl_module.nside,
-                min_samples_per_pix=pl_module.min_samples_per_pix,
-                use_distance=True,
-                contours=self.contours,
+        test_results = pl_module.test_results
+
+        func = partial(
+            crossmatch_skymap,
+            nside=pl_module.nside,
+            min_samples_per_pix=pl_module.min_samples_per_pix,
+            contours=self.contours,
+        )
+
+        with mp.Pool(processes=min(mp.cpu_count(), len(test_results))) as pool:
+            crossmatch_results = list(
+                tqdm(
+                    pool.imap(func, test_results),
+                    total=len(test_results),
+                    desc="Crossmatching skymaps",
+                )
             )
-            crossmatch_results.append(crossmatch_result)
 
         self.write_skymap_statistics(test_outdir, crossmatch_results)
 
@@ -459,6 +496,7 @@ class CrossMatchStatistics(pl.Callback):
         searched_volumes = np.sort(searched_volumes)
         counts = np.arange(1, len(searched_areas) + 1) / len(searched_areas)
 
+        # searched volume cum hist
         plt.figure(figsize=(10, 6))
         plt.step(searched_volumes, counts, where="post")
         plt.xscale("log")
@@ -467,8 +505,9 @@ class CrossMatchStatistics(pl.Callback):
         plt.title("Searched Volume Cumulative Distribution Function")
         plt.grid()
         plt.axhline(0.5, color="grey", linestyle="--")
-        plt.savefig(test_outdir / "searched_volume.png")
+        plt.savefig(test_outdir / "plots" / "searched_volume.png")
 
+        # searched area cum hist
         plt.figure(figsize=(10, 6))
         plt.step(searched_areas, counts, where="post")
         plt.xscale("log")
@@ -477,7 +516,7 @@ class CrossMatchStatistics(pl.Callback):
         plt.title("Searched Area Cumulative Distribution Function")
         plt.grid()
         plt.axhline(0.5, color="grey", linestyle="--")
-        plt.savefig(test_outdir / "searched_area.png")
+        plt.savefig(test_outdir / "plots" / "searched_area.png")
 
         plt.close()
         plt.figure(figsize=(10, 6))
@@ -489,4 +528,118 @@ class CrossMatchStatistics(pl.Callback):
         )
         plt.xlabel("Sq. deg.")
         plt.legend()
-        plt.savefig(test_outdir / "fifty_ninety_areas.png")
+        plt.savefig(test_outdir / "plots" / "fifty_ninety_areas.png")
+        plt.close()
+
+        # searched prob pp-plot
+        searched_probs = [
+            result.searched_prob for result in crossmatch_results
+        ]
+
+        fig = plt.figure(figsize=(7, 7))
+        ax = fig.add_subplot(111, projection="pp_plot")
+        plt.rcParams.update({"font.size": 16})
+
+        number_of_samples = len(searched_probs)
+        alphas = [0.68, 0.95, 0.997]
+        for alpha in alphas:
+            ax.add_confidence_band(
+                number_of_samples,
+                alpha=alpha,
+                color=(0, 0, 0, 0.1),
+                edgecolor=(0, 0, 0, 0.2),
+                annotate=False,
+            )
+        ax.add_diagonal()
+        p = scipy.stats.kstest(searched_probs, "uniform").pvalue
+        ax.add_series(
+            searched_probs,
+            label="AMPLFI"
+            + r"$~({0:#.2g})$ ".format(round(p, 2))
+            + str(len(searched_probs))
+            + " events",
+            color="saddlebrown",
+            linewidth=2,
+        )
+
+        plt.title("Searched Area Probability-Probability Plot")
+        ax.set_xlabel("Credible interval")
+        ax.set_ylabel("Fraction of events in credible interval")
+        ax.grid(True)
+        ax.legend()
+        fig.savefig(test_outdir / "plots" / "searched_prob_pp_plot.png")
+        plt.close()
+
+        # searched prob-vol pp-plot
+        searched_prob_vols = [
+            result.searched_prob_vol for result in crossmatch_results
+        ]
+
+        fig = plt.figure(figsize=(7, 7))
+        ax = fig.add_subplot(111, projection="pp_plot")
+        plt.rcParams.update({"font.size": 16})
+
+        number_of_samples = len(searched_prob_vols)
+        alphas = [0.68, 0.95, 0.997]
+        for alpha in alphas:
+            ax.add_confidence_band(
+                number_of_samples,
+                alpha=alpha,
+                color=(0, 0, 0, 0.1),
+                edgecolor=(0, 0, 0, 0.2),
+                annotate=False,
+            )
+        ax.add_diagonal()
+        p = scipy.stats.kstest(searched_prob_vols, "uniform").pvalue
+        ax.add_series(
+            searched_prob_vols,
+            label="AMPLFI"
+            + r"$~({0:#.2g})$ ".format(round(p, 2))
+            + str(len(searched_prob_vols))
+            + " events",
+            color="saddlebrown",
+            linewidth=2,
+        )
+
+        plt.title("Searched Volume Probability-Probability Plot")
+        ax.set_xlabel("Credible interval")
+        ax.set_ylabel("Fraction of events in credible interval")
+        ax.grid(True)
+        ax.legend()
+        fig.savefig(test_outdir / "plots" / "searched_prob_vol_pp_plot.png")
+        plt.close()
+
+
+class SaveInjectionParameters(pl.Callback):
+    """
+    Save randomly sampled injection parameters to a file
+    at the end of each test epoch.
+    """
+
+    def __init__(self, outdir: Path):
+        self.outdir = outdir
+
+    def on_test_epoch_start(self, trainer, pl_module: "FlowModel"):
+        # initialize field in test parameters for snr
+        num_test = len(trainer.datamodule.test_dataloader())
+        trainer.datamodule.test_parameters["snr"] = np.zeros(num_test)
+
+    def on_test_epoch_end(self, trainer, pl_module: "FlowModel"):
+        # save parameters of randomly sampled injections
+        with h5py.File(self.outdir / "parameters.hdf5", "w") as f:
+            for param, data in trainer.datamodule.test_parameters.items():
+                f.create_dataset(param, data=data)
+
+    def on_test_batch_end(
+        self,
+        trainer,
+        pl_module: "FlowModel",
+        outputs,
+        batch,
+        batch_idx,
+        dataloader_idx=0,
+    ):
+        result: AmplfiResult = outputs
+        trainer.datamodule.test_parameters["snr"][batch_idx] = (
+            result.injection_parameters["snr"]
+        )

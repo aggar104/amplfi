@@ -16,9 +16,12 @@ from ..waveforms.sampler import WaveformSampler
 import numpy as np
 from pathlib import Path
 import random
+from tqdm.auto import tqdm
 
 Tensor = torch.Tensor
 Distribution = torch.distributions.Distribution
+
+SECONDS_PER_DAY = 86400
 
 
 class AmplfiDataset(pl.LightningDataModule):
@@ -60,6 +63,15 @@ class AmplfiDataset(pl.LightningDataModule):
             for training, validation and testing.
             See `train.data.waveforms.sampler`
             for methods this object should define.
+        train_val_range:
+            Tuple of gpstimes that specify time range of
+            training and validation data.
+            Will filter the data directory to only include files that contain
+            segments that overlap with this range. If `None`, use all data.
+        test_range:
+            Tuple of gpstimes that specify range of testing data to use.
+            Will filter the data directory to only include files that contain
+            segments that overlap with this range. If `None`, use all data.
         fftlength:
             Length of the fft used to calculate the psd.
             Defaults to `kernel_length`
@@ -88,6 +100,8 @@ class AmplfiDataset(pl.LightningDataModule):
         ifos: List[str],
         waveform_sampler: WaveformSampler,
         fftlength: Optional[int] = None,
+        train_val_range: Optional[tuple[float, float]] = None,
+        test_range: Optional[tuple[float, float]] = None,
         min_valid_duration: float = 10000,
         num_files_per_batch: Optional[int] = None,
         max_num_workers: int = 6,
@@ -220,18 +234,48 @@ class AmplfiDataset(pl.LightningDataModule):
         """Use larger batch sizes when we don't need gradients."""
         return int(1 * self.hparams.batch_size)
 
-    @property
-    def train_val_fnames(self):
+    def filter_fnames(self, fnames: Sequence[str], start: float, end: float):
+        filtered_fnames = []
+        fstarts = [int(fname.stem.split("-")[1]) for fname in fnames]
+
+        for i, fstart in enumerate(fstarts):
+            if fstart >= start and fstart <= end:
+                filtered_fnames.append(fnames[i])
+        return filtered_fnames
+
+    def get_train_val_fnames(self):
         """List of background files used for both training and validation"""
         background_dir = self.data_dir / "train" / "background"
-        fnames = list(background_dir.glob("*.hdf5"))
+        fnames = sorted((background_dir.glob("*.hdf5")))
+        if self.hparams.train_val_range is not None:
+            start, end = self.hparams.train_val_range
+            self._logger.info(
+                f"Downselecting training and validation data "
+                f"between {start} to {end}"
+            )
+            fnames = self.filter_fnames(fnames, start, end)
+
         return fnames
 
-    @property
-    def test_fnames(self):
+    def get_test_fnames(self):
         """List of background files used for testing a trained model"""
         test_dir = self.data_dir / "test" / "background"
         fnames = list(test_dir.glob("*.hdf5"))
+        if self.hparams.test_range is not None:
+            start, end = self.hparams.test_range
+            self._logger.info(
+                f"Downselecting testing data between {start} to {end}"
+            )
+            fnames = self.filter_fnames(fnames, start, end)
+
+        duration = (
+            sum([int(fname.stem.split("-")[-1]) for fname in fnames])
+            / SECONDS_PER_DAY
+        )
+        self._logger.info(
+            f"Using {len(fnames)} files with a total duration "
+            f"of {duration:.3f} days for testing"
+        )
         return fnames
 
     def train_val_split(self) -> Sequence[str]:
@@ -239,7 +283,8 @@ class AmplfiDataset(pl.LightningDataModule):
         Split background files into training and validation sets
         based on the requested duration of the validation set
         """
-        fnames = sorted(self.train_val_fnames)
+        fnames = sorted(self.get_train_val_fnames())
+
         durations = [int(fname.stem.split("-")[-1]) for fname in fnames]
         valid_fnames = []
         valid_duration = 0
@@ -249,6 +294,19 @@ class AmplfiDataset(pl.LightningDataModule):
             valid_fnames.append(str(fname))
 
         train_fnames = fnames
+        train_duration = (
+            sum([int(fname.stem.split("-")[-1]) for fname in train_fnames])
+            / SECONDS_PER_DAY
+        )
+
+        self._logger.info(
+            f"Using {len(train_fnames)} files with a total duration "
+            f"of {train_duration:.3f} days for training"
+        )
+        self._logger.info(
+            f"Using {len(valid_fnames)} files with a total duration "
+            f"of {valid_duration / SECONDS_PER_DAY:.3f} days for validation"
+        )
         return train_fnames, valid_fnames
 
     # ================================================ #
@@ -306,12 +364,22 @@ class AmplfiDataset(pl.LightningDataModule):
     def setup(self, stage: str) -> None:
         world_size, rank = self.get_world_size_and_rank()
         self._logger = self.get_logger(world_size, rank)
-        self.train_fnames, self.val_fnames = self.train_val_split()
 
         self._logger.info(f"Setting up data for stage {stage}")
+        if stage in ["fit", "validate"]:
+            self.train_fnames, self.val_fnames = self.train_val_split()
+
+        elif stage == "test":
+            self.test_fnames = self.get_test_fnames()
 
         # infer sample rate directly from background data
-        with h5py.File(self.train_fnames[0], "r") as f:
+        # and validate that it matches specified sample rate
+        sample_file = (
+            self.train_fnames[0]
+            if stage in ["fit", "validate"]
+            else self.test_fnames[0]
+        )
+        with h5py.File(sample_file, "r") as f:
             sample_rate = 1 / f[self.hparams.ifos[0]].attrs["dx"]
             assert sample_rate == self.hparams.sample_rate
 
@@ -323,10 +391,6 @@ class AmplfiDataset(pl.LightningDataModule):
         # get_val_waveforms should be implemented by waveform_sampler object
         if stage in ["fit", "validate"]:
             self.val_background = self.load_background(self.val_fnames)
-            self._logger.info(
-                f"Loaded background files {self.val_fnames} for validation"
-            )
-
             cross, plus, parameters = self.waveform_sampler.get_val_waveforms(
                 rank, world_size
             )
@@ -340,9 +404,6 @@ class AmplfiDataset(pl.LightningDataModule):
             self.val_parameters = torch.column_stack(params)
 
         elif stage == "test":
-            self._logger.info(
-                f"Loaded background files {self.test_fnames} for testing"
-            )
             (
                 cross,
                 plus,
@@ -356,8 +417,9 @@ class AmplfiDataset(pl.LightningDataModule):
                 if k in parameters.keys():
                     params.append(torch.Tensor(parameters[k]))
 
+            self.test_inference_params = torch.column_stack(params)
+            self.test_parameters: dict[str, torch.tensor] = parameters
             self.test_waveforms = torch.stack([cross, plus], dim=0)
-            self.test_parameters = torch.column_stack(params)
 
         # once we've generated validation/testing waveforms on cpu,
         # build data augmentation modules
@@ -388,7 +450,7 @@ class AmplfiDataset(pl.LightningDataModule):
         if self.trainer.training:
             [batch] = batch
             cross, plus, parameters = self.waveform_sampler.sample(batch)
-            strain, asds, parameters = self.inject(
+            strain, asds, parameters, snrs = self.inject(
                 batch, cross, plus, parameters
             )
 
@@ -402,7 +464,7 @@ class AmplfiDataset(pl.LightningDataModule):
                 if k not in ["dec", "psi", "phi"]
             ]
             parameters = {k: parameters[:, i] for i, k in enumerate(keys)}
-            strain, asds, parameters = self.inject(
+            strain, asds, parameters, snrs = self.inject(
                 background, cross, plus, parameters
             )
 
@@ -414,11 +476,11 @@ class AmplfiDataset(pl.LightningDataModule):
                 if k not in ["dec", "psi", "phi"]
             ]
             parameters = {k: parameters[:, i] for i, k in enumerate(keys)}
-            strain, asds, parameters = self.inject(
+            strain, asds, parameters, snrs = self.inject(
                 background, cross, plus, parameters
             )
 
-        return strain, asds, parameters
+        return strain, asds, parameters, snrs
 
     # ================================================ #
     # Dataloaders used by lightning
@@ -502,7 +564,7 @@ class AmplfiDataset(pl.LightningDataModule):
         # build waveform dataloader
         cross, plus = self.test_waveforms
         waveform_dataset = torch.utils.data.TensorDataset(
-            cross, plus, self.test_parameters
+            cross, plus, self.test_inference_params
         )
         waveform_dataloader = torch.utils.data.DataLoader(
             waveform_dataset,
@@ -511,7 +573,6 @@ class AmplfiDataset(pl.LightningDataModule):
             pin_memory=False,
             num_workers=10,
         )
-
         if len(self.test_fnames) == 1:
             test_background = self.load_background(self.test_fnames)[0]
             background_dataset = InMemoryDataset(
@@ -574,7 +635,7 @@ class AmplfiDataset(pl.LightningDataModule):
                 in_segment = time > start + self.sample_length
                 in_segment &= time < (start + length - self.sample_length)
                 if in_segment:
-                    return self.test_fnames[i], start
+                    return fnames[i], start
             else:
                 return None, None
 
@@ -589,41 +650,41 @@ class AmplfiDataset(pl.LightningDataModule):
         )
 
         # convert to number of indices
-        post = int(post * self.hparams.sample_rate)
-        pre = int(pre * self.hparams.sample_rate)
+        num_post = int(post * self.hparams.sample_rate)
+        num_pre = int(pre * self.hparams.sample_rate)
 
         background = []
-        for time in gpstimes:
+        self._logger.info("Loading background segments for testing")
+        for time in tqdm(gpstimes):
             time = time.item()
             strain = []
 
             # find file for this gpstime
             file, start = find_file(time)
-
             # if none exists, use random segment
             if file is None:
                 self._logger.info(
                     "No segment in testing directory containing "
                     f"{time}. Using random segment"
                 )
-                file = random.choice(self.test_fnames)
+                file = random.choice()
                 start, length = list(
                     map(float, file.name.split(".")[0].split("-")[1:])
                 )
                 time = start + random.randint(
-                    self.sample_length,
-                    length - self.sample_length,
+                    -int(pre),
+                    int(length - post),
                 )
 
             # convert from time to index in file
             middle_idx = int((time - start) * self.hparams.sample_rate)
-            start_idx = middle_idx + pre
-            end_idx = middle_idx + post
+            start_idx = middle_idx + num_pre
+            end_idx = middle_idx + num_post
 
             with h5py.File(file) as f:
                 for ifo in self.hparams.ifos:
-                    strain.append(torch.tensor(f[ifo][start_idx:end_idx]))
-                strain = torch.stack(strain, dim=0)
+                    strain.append(f[ifo][start_idx:end_idx])
+                strain = np.stack(strain, axis=0)
                 background.append(strain)
-        background = torch.stack(background, dim=0)
-        return background
+        background = np.stack(background, axis=0)
+        return torch.tensor(background)

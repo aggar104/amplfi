@@ -11,9 +11,8 @@ import numpy as np
 import torch
 from astropy.time import Time
 from ml4gw.waveforms.conversion import chirp_mass_and_mass_ratio_to_components
-
 from amplfi.train.data.datasets import FlowDataset
-
+from ml4gw import gw
 from ..utils.utils import ZippedDataset
 
 
@@ -45,13 +44,12 @@ class StrainTestingDataset(FlowDataset):
             Path to hdf5 file containing premade injections.
             For each interferometer being analyzed, the strain
             data should be stored in an hdf5 dataset named
-            after that interferometer.The dataset should be
+            after that interferometer. The dataset should be
             of shape (batch, time). It is assumed that the coalescence
             time of the injection is placed in the middle of each sample
-            of the array. In addition, the parameters used to generate
-            each injection should live in a dataset named after the
-            parameter, e.g. `chirp_mass`.
-
+            of the array. In addition, each inference parameter
+            should be stored in a dataset with the same name as the
+            parameter, e.g. `chirp_mass`, `mass_ratio`, etc.
 
     """
 
@@ -123,13 +121,15 @@ class StrainTestingDataset(FlowDataset):
         self.build_transforms(stage)
         self.transforms_to_device()
 
-        self.parameters = parameters
-        self.strain = strain
+        self.test_inference_params = parameters
+        self.test_strain = strain
 
     def test_dataloader(self) -> torch.utils.data.DataLoader:
         # build dataset and dataloader that will
         # simply load one injection (and its parameters) at a time
-        dataset = torch.utils.data.TensorDataset(self.strain, self.parameters)
+        dataset = torch.utils.data.TensorDataset(
+            self.test_strain, self.test_inference_params
+        )
 
         return torch.utils.data.DataLoader(
             dataset, batch_size=1, num_workers=12, shuffle=False
@@ -170,7 +170,9 @@ class StrainTestingDataset(FlowDataset):
         psds = psds[:, :, mask]
         asds = torch.sqrt(psds)
 
-        return X, asds, parameters
+        # return None for snrs, since for strain testing set
+        # we don't have the raw waveforms to calculate SNRs
+        return X, asds, parameters, None
 
 
 class ParameterTestingDataset(FlowDataset):
@@ -241,7 +243,7 @@ class ParameterTestingDataset(FlowDataset):
                     continue
 
                 parameters[parameter] = torch.tensor(
-                    f[parameter][:], dtype=torch.float32
+                    f[parameter], dtype=torch.float32
                 )
 
         # apply conversion function to parameters
@@ -275,10 +277,15 @@ class ParameterTestingDataset(FlowDataset):
             if k in parameters.keys():
                 params.append(torch.Tensor(parameters[k]))
 
-        self.waveforms = torch.stack([cross, plus], dim=0)
-        self.parameters = torch.column_stack(params)
+        # torch tensor of inference parameters
+        # that the model will draw samples for
+        self.test_inference_params = torch.column_stack(params)
+        # the whole set of parameters used to generate the waveforms
+        self.test_parameters: dict[str, torch.tensor] = parameters
+        self.test_waveforms = torch.stack([cross, plus], dim=0)
+
         self.background = self.background_from_gpstimes(
-            parameters["gpstime"], self.test_fnames
+            parameters["gpstime"], self.get_test_fnames()
         )
 
         # once we've generated validation/testing waveforms on cpu,
@@ -288,10 +295,10 @@ class ParameterTestingDataset(FlowDataset):
         self.transforms_to_device()
 
     def test_dataloader(self) -> torch.utils.data.DataLoader:
-        cross, plus = self.waveforms
+        cross, plus = self.test_waveforms
 
         waveform_dataset = torch.utils.data.TensorDataset(
-            cross, plus, self.parameters
+            cross, plus, self.test_inference_params
         )
 
         waveform_dataloader = torch.utils.data.DataLoader(
@@ -337,13 +344,6 @@ class ParameterTestingDataset(FlowDataset):
         )
         waveforms = self.projector(dec, psi, phi, cross=cross, plus=plus)
 
-        # downselect to requested inference parameters
-        parameters = {
-            k: v
-            for k, v in parameters.items()
-            if k in self.hparams.inference_params
-        }
-
         # make any requested parameter transforms
         parameters = self.transform(parameters)
         parameters = [
@@ -352,6 +352,18 @@ class ParameterTestingDataset(FlowDataset):
         parameters = torch.vstack(parameters).T
 
         X, psds = self.psd_estimator(X)
+
+        num_freqs = waveforms.shape[-1] // 2 + 1
+        psds = torch.nn.functional.interpolate(
+            psds, size=(num_freqs,), mode="linear"
+        )
+        snrs = gw.compute_network_snr(
+            waveforms,
+            psds,
+            self.hparams.sample_rate,
+            self.hparams.highpass,
+        )
+
         X += waveforms
         X = self.whitener(X, psds)
 
@@ -369,7 +381,7 @@ class ParameterTestingDataset(FlowDataset):
         psds = psds[:, :, mask]
         asds = torch.sqrt(psds)
 
-        return X, asds, parameters
+        return X, asds, parameters, snrs
 
 
 class RawStrainTestingDataset(FlowDataset):
@@ -412,11 +424,12 @@ class RawStrainTestingDataset(FlowDataset):
         self._logger = self.get_logger(world_size, rank)
         if stage != "predict":
             raise ValueError(
-                "RealEventDataset should only be used with `predict` stage"
+                "RawStrainTestingDataset should only be used "
+                "with `predict` stage"
             )
 
         self.background = self.background_from_gpstimes(
-            self.gpstimes, self.test_fnames
+            self.gpstimes, self.get_test_fnames()
         )
 
         # once we've generated validation/testing waveforms on cpu,
