@@ -124,7 +124,7 @@ class FlowModel(AmplfiModel):
         training_prior = waveform_sampler.training_prior
 
         for key in ["dec", "psi", "phi"]:
-            training_prior.priors[key] = getattr(self.trainer.datamodule, key)
+            training_prior.priors[key] = getattr(waveform_sampler, key)
 
         self.training_prior: "AmplfiPrior" = training_prior
 
@@ -307,7 +307,7 @@ class FlowModel(AmplfiModel):
         for i, param in enumerate(self.inference_params):
             samples = parameters[:, i]
             if param in ["dec", "psi", "phi"]:
-                prior = getattr(self.trainer.datamodule, param)
+                prior = getattr(self.trainer.datamodule.waveform_sampler, param)
             else:
                 prior = priors[param]
 

@@ -71,8 +71,8 @@ class AmplfiPrior:
             log_probs = log_probs + self.priors["distance"].log_prob(dL).to(
                 first.device
             )
-            # Jacobian = -(5/6) log Mc
-            log_probs = log_probs - (5.0 / 6.0) * torch.log(mc)
+            # Jacobian = (5/6) log Mc
+            log_probs = log_probs + (5.0 / 6.0) * torch.log(mc)
 
         for param, tensor in samples.items():
             if param == "distance":
