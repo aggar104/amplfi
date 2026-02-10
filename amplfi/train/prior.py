@@ -8,6 +8,7 @@ class AmplfiPrior:
         self,
         priors: dict[str, torch.distributions.Distribution],
         conversion_function: Optional[Callable] = None,
+        chirp_distance_conv: bool = False,
     ):
         """
         A class for sampling parameters from a prior distribution
@@ -24,6 +25,7 @@ class AmplfiPrior:
         super().__init__()
         self.priors = priors
         self.conversion_function = conversion_function or (lambda x: x)
+        self.chirp_distance_conv = chirp_distance_conv
 
     def __call__(
         self,
@@ -59,7 +61,22 @@ class AmplfiPrior:
 
         first = samples[list(samples.keys())[0]]
         log_probs = torch.ones(len(first), device=first.device)
+
+        if self.chirp_distance_conv:
+            dc = samples["distance"]
+            mc = samples["chirp_mass"]
+            mc_pow = mc.pow(5.0 / 6.0)
+            dL = dc / mc_pow
+            # base prior for luminosity distance
+            log_probs = log_probs + self.priors["distance"].log_prob(dL).to(
+                first.device
+            )
+            # Jacobian = -(5/6) log Mc
+            log_probs = log_probs - (5.0 / 6.0) * torch.log(mc)
+
         for param, tensor in samples.items():
+            if param == "distance":
+                continue
             log_probs += self.priors[param].log_prob(tensor).to(first.device)
         return log_probs
 
