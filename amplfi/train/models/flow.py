@@ -304,12 +304,22 @@ class FlowModel(AmplfiModel):
             parameters.shape[0], dtype=bool, device=parameters.device
         )
         priors = self.training_prior.priors
+
+        # get cm samples
+        for i, param in enumerate(self.inference_params):
+            if param == "chirp_mass":
+                cm_samples = parameters[:,i]
+
+
         for i, param in enumerate(self.inference_params):
             samples = parameters[:, i]
             if param in ["dec", "psi", "phi"]:
                 prior = getattr(self.trainer.datamodule.waveform_sampler, param)
             else:
                 prior = priors[param]
+
+            if param == 'distance':
+                samples = samples / (cm_samples**(5/6))
 
             mask = (prior.log_prob(samples) == float("-inf")).to(
                 samples.device

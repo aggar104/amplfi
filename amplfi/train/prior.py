@@ -1,7 +1,7 @@
 from typing import Callable, Optional
-
+from pathlib import Path
 import torch
-
+import os
 
 class AmplfiPrior:
     def __init__(
@@ -61,23 +61,14 @@ class AmplfiPrior:
 
         first = samples[list(samples.keys())[0]]
         log_probs = torch.ones(len(first), device=first.device)
+        samples_dir = "/home/shrey.aggarwal/amplfi/nsbh/outdir/samples"
+        save_with_increment(samples, samples_dir)
 
-        if self.chirp_distance_conv:
-            dc = samples["distance"]
-            mc = samples["chirp_mass"]
-            mc_pow = mc.pow(5.0 / 6.0)
-            dL = dc / mc_pow
-            # base prior for luminosity distance
-            log_probs = log_probs + self.priors["distance"].log_prob(dL).to(
-                first.device
-            )
-            # Jacobian = (5/6) log Mc
-            log_probs = log_probs + (5.0 / 6.0) * torch.log(mc)
-
+        samples['distance'] = samples['distance'] / (samples["chirp_mass"] ** (5/6))
         for param, tensor in samples.items():
-            if param == "distance":
-                continue
             log_probs += self.priors[param].log_prob(tensor).to(first.device)
+
+        log_probs = log_probs - torch.log(samples['chirp_mass'] ** (5/6))
         return log_probs
 
 
@@ -114,3 +105,17 @@ class ParameterTransformer(torch.nn.Module):
         # update parameter dict
         parameters.update(transformed)
         return parameters
+
+def save_with_increment(data, directory=".", base_name="samples", ext=".pt"):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    i = 0
+    flag = True
+    while flag:
+        filename = directory / f"{base_name}{i:02d}{ext}"
+        if not filename.exists():
+            torch.save(data, filename)
+            flag = False
+            #return filename
+        i += 1
