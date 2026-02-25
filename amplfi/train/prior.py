@@ -8,6 +8,7 @@ class AmplfiPrior:
         self,
         priors: dict[str, torch.distributions.Distribution],
         conversion_function: Optional[Callable] = None,
+        transform_function: Optional[[Callable]] = None,
     ):
         """
         A class for sampling parameters from a prior distribution
@@ -17,13 +18,14 @@ class AmplfiPrior:
                 A dictionary of parameter samplers that take an integer N
                 and return a tensor of shape (N, ...) representing
                 samples from the prior distribution
-            conversion_function:
+            conversion_functions:
                 A callable that takes a dictionary of sampled parameters
                 and returns a dictionary of waveform generation parameters
         """
         super().__init__()
         self.priors = priors
-        self.conversion_function = conversion_function or (lambda x: x)
+        self.conversion_function = conversion_function or [(lambda x: x)]
+        self.transform_function = transform_function
 
     def __call__(
         self,
@@ -45,6 +47,7 @@ class AmplfiPrior:
         # to from sampled parameters to
         # waveform generation parameters
         parameters = self.conversion_function(parameters)
+        parameters = self.transform_function(parameters)
         return parameters
 
     def log_prob(self, samples: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -56,12 +59,28 @@ class AmplfiPrior:
                 Dictionary where key is parameter and
                 value is tensor of samples
         """
-
         first = samples[list(samples.keys())[0]]
         log_probs = torch.ones(len(first), device=first.device)
+
+        # Apply transformations
+        if self.transform_function is not None:
+            samples = self.transform_function(samples, reverse=True)
+
         for param, tensor in samples.items():
             log_probs += self.priors[param].log_prob(tensor).to(first.device)
+        log_probs += self.jacobian(samples)
         return log_probs
+
+    def jacobian(self, samples: dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Calculate Jacobian for the log probability if required
+        If no transformations, a torch.tensor with zeros is returned
+        """
+        first = samples[list(samples.keys())[0]]
+        if self.transform_function is not None:
+            return self.transform_function(samples, jacobian=True)
+        else:
+            return torch.zeros(len(first), device=first.device)
 
 
 class ParameterTransformer(torch.nn.Module):
