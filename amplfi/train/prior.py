@@ -8,7 +8,7 @@ class AmplfiPrior:
         self,
         priors: dict[str, torch.distributions.Distribution],
         conversion_function: Optional[Callable] = None,
-        transform_function: Optional[[Callable]] = None,
+        transform_function: Optional[Callable] = None,
     ):
         """
         A class for sampling parameters from a prior distribution
