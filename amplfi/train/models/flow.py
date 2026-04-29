@@ -304,8 +304,17 @@ class FlowModel(AmplfiModel):
             parameters.shape[0], dtype=bool, device=parameters.device
         )
         priors = self.training_prior.priors
-        for i, param in enumerate(self.inference_params):
-            samples = parameters[:, i]
+
+        # create samples dictionary
+        # tansform if required
+        samples_dict = {
+            k: parameters[:, i] for i, k in enumerate(self.inference_params)
+        }
+        transform_func = self.training_prior.transform_function
+        if transform_func is not None:
+            samples_dict = transform_func(samples_dict, reverse=True)
+
+        for param, samples in samples_dict.items():
             if param in ["dec", "psi", "phi"]:
                 prior = getattr(self.trainer.datamodule, param)
             else:

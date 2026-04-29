@@ -8,6 +8,7 @@ class AmplfiPrior:
         self,
         priors: dict[str, torch.distributions.Distribution],
         conversion_function: Optional[Callable] = None,
+        transform_function: Optional[Callable] = None,
     ):
         """
         A class for sampling parameters from a prior distribution
@@ -24,6 +25,7 @@ class AmplfiPrior:
         super().__init__()
         self.priors = priors
         self.conversion_function = conversion_function or (lambda x: x)
+        self.transform_function = transform_function
 
     def __call__(
         self,
@@ -45,6 +47,8 @@ class AmplfiPrior:
         # to from sampled parameters to
         # waveform generation parameters
         parameters = self.conversion_function(parameters)
+        if self.transform_function is not None:
+            parameters = self.transform_function(parameters)
         return parameters
 
     def log_prob(self, samples: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -59,9 +63,25 @@ class AmplfiPrior:
 
         first = samples[list(samples.keys())[0]]
         log_probs = torch.ones(len(first), device=first.device)
+
+        if self.transform_function is not None:
+            samples = self.transform_function(samples, reverse=True)
+            
         for param, tensor in samples.items():
             log_probs += self.priors[param].log_prob(tensor).to(first.device)
+        log_probs += self.jacobian(samples)
         return log_probs
+
+    def jacobian(self, samples: dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Calculate Jacobian for the log probability if required
+        If no transformations, a torch.tensor with zeros is returned
+        """
+        first = samples[list(samples.keys())[0]]
+        if self.transform_function is not None:
+            return self.transform_function(samples, jacobian=True)
+        else:
+            return torch.zeros(len(first), device=first.device)
 
 
 class ParameterTransformer(torch.nn.Module):
